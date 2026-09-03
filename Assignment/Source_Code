@@ -1,0 +1,1010 @@
+import csv
+import hashlib
+import os
+import sys
+from collections import defaultdict
+from datetime import datetime
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+
+TS_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+evidence_register = []
+custody_log = []
+integrity_log = []
+
+REQUIRED_FIELDS = [
+    "evidence_id",
+    "source",
+    "acquisition_datetime",
+    "investigator",
+    "storage_location",
+    "file_path",
+    "intake_sha256"
+]
+
+
+# ============================================================
+# 1. FILE UTILITIES
+# ============================================================
+
+def data_path(filename):
+    """
+    Looks for CSV files first inside data/,
+    then in the same folder as this Python program.
+    """
+
+    path1 = os.path.join(DATA_DIR, filename)
+
+    if os.path.exists(path1):
+        return path1
+
+    return os.path.join(BASE_DIR, filename)
+
+
+def load_csv(filename):
+    """Load a CSV file and return a list of dictionaries."""
+
+    path = data_path(filename)
+
+    if not os.path.exists(path):
+        print(f"[!] File not found: {path}")
+        return []
+
+    with open(path, "r", newline="", encoding="utf-8-sig") as file:
+        return list(csv.DictReader(file))
+
+
+def save_csv(filename, rows, fieldnames):
+    """Save records to CSV."""
+
+    path = data_path(filename)
+
+    folder = os.path.dirname(path)
+
+    if folder:
+        os.makedirs(folder, exist_ok=True)
+
+    with open(path, "w", newline="", encoding="utf-8") as file:
+        writer = csv.DictWriter(file, fieldnames=fieldnames)
+
+        writer.writeheader()
+        writer.writerows(rows)
+
+
+# ============================================================
+# 2. SHA-256 HASHING
+# ============================================================
+
+def compute_sha256(file_path, chunk_size=65536):
+    """
+    Calculate SHA-256 hash.
+
+    The file is read in binary chunks instead of loading
+    the complete evidence file into memory.
+    """
+
+    sha256 = hashlib.sha256()
+
+    with open(file_path, "rb") as file:
+
+        while True:
+
+            chunk = file.read(chunk_size)
+
+            if not chunk:
+                break
+
+            sha256.update(chunk)
+
+    return sha256.hexdigest()
+
+
+# ============================================================
+# 3. FIND EVIDENCE FILE
+# ============================================================
+
+def resolve_evidence_path(file_path):
+    """
+    Find the actual evidence file.
+
+    Supports files located:
+    - beside the Python program
+    - inside data/
+    - inside evidence_files/
+    """
+
+    if not file_path:
+        return None
+
+    # Remove quotes if the user entered them
+    file_path = file_path.strip().strip('"').strip("'")
+
+    candidates = [
+
+        # Full Windows path entered by user
+        file_path,
+
+        # Relative to program directory
+        os.path.join(
+            BASE_DIR,
+            file_path.lstrip("./\\")
+        ),
+
+        # Relative to data directory
+        os.path.join(
+            DATA_DIR,
+            file_path.lstrip("./\\")
+        ),
+
+        # evidence_files folder
+        os.path.join(
+            BASE_DIR,
+            "evidence_files",
+            os.path.basename(file_path)
+        ),
+
+        os.path.join(
+            DATA_DIR,
+            "evidence_files",
+            os.path.basename(file_path)
+        ),
+
+        # Just filename
+        os.path.join(
+            BASE_DIR,
+            os.path.basename(file_path)
+        ),
+
+        os.path.join(
+            DATA_DIR,
+            os.path.basename(file_path)
+        )
+    ]
+
+    for candidate in candidates:
+
+        if os.path.exists(candidate):
+
+            return os.path.abspath(candidate)
+
+    # Search folders for files with matching basename
+    filename = os.path.basename(file_path).lower()
+
+    search_folders = [
+        BASE_DIR,
+        DATA_DIR,
+        os.path.join(BASE_DIR, "evidence_files"),
+        os.path.join(DATA_DIR, "evidence_files")
+    ]
+
+    for folder in search_folders:
+
+        if not os.path.isdir(folder):
+            continue
+
+        for name in os.listdir(folder):
+
+            if name.lower() == filename:
+
+                return os.path.join(folder, name)
+
+    return None
+
+
+# ============================================================
+# 4. EVIDENCE VALIDATION
+# ============================================================
+
+def validate_metadata(record):
+
+    missing = []
+
+    for field in REQUIRED_FIELDS:
+
+        if not record.get(field):
+            missing.append(field)
+
+    return missing
+
+
+# ============================================================
+# 5. EVIDENCE REGISTRATION
+# ============================================================
+
+def register_evidence(
+        evidence_id,
+        source,
+        file_path,
+        investigator,
+        storage_location,
+        acquisition_datetime=None):
+
+    # Check duplicate ID
+    for evidence in evidence_register:
+
+        if evidence.get("evidence_id") == evidence_id:
+
+            print(
+                f"[!] Evidence ID already exists: {evidence_id}"
+            )
+
+            return None
+
+    # Find actual evidence file
+    full_path = resolve_evidence_path(file_path)
+
+    if not full_path:
+
+        print(
+            f"[!] Evidence file not found: {file_path}"
+        )
+
+        return None
+
+    # Calculate SHA-256
+    intake_hash = compute_sha256(full_path)
+
+    record = {
+
+        "evidence_id": evidence_id,
+
+        "source": source,
+
+        "acquisition_datetime":
+            acquisition_datetime
+            if acquisition_datetime
+            else datetime.now().strftime(TS_FORMAT),
+
+        "investigator": investigator,
+
+        "storage_location": storage_location,
+
+        "file_path": file_path,
+
+        "intake_sha256": intake_hash
+    }
+
+    evidence_register.append(record)
+
+    print("\n[OK] Evidence registered successfully")
+
+    print(
+        f"Evidence ID : {evidence_id}"
+    )
+
+    print(
+        f"SHA-256     : {intake_hash}"
+    )
+
+    return record
+
+
+# ============================================================
+# 6. LOAD EXISTING EVIDENCE REGISTER
+# ============================================================
+
+def load_case_data():
+
+    global evidence_register
+    global custody_log
+
+    evidence_register = load_csv(
+        "evidence_register.csv"
+    )
+
+    custody_log = load_csv(
+        "custody_log.csv"
+    )
+
+    # --------------------------------------------------------
+    # IMPORTANT FIX
+    #
+    # The supplied evidence_register.csv may not contain
+    # intake_sha256.
+    #
+    # Therefore calculate it automatically.
+    # --------------------------------------------------------
+
+    for record in evidence_register:
+
+        if not record.get("intake_sha256"):
+
+            file_path = record.get("file_path", "")
+
+            actual_file = resolve_evidence_path(
+                file_path
+            )
+
+            if actual_file:
+
+                record["intake_sha256"] = compute_sha256(
+                    actual_file
+                )
+
+            else:
+
+                record["intake_sha256"] = ""
+
+    print(
+        f"[OK] Loaded {len(evidence_register)} evidence records."
+    )
+
+    print(
+        f"[OK] Loaded {len(custody_log)} custody records."
+    )
+
+
+# ============================================================
+# 7. CHAIN OF CUSTODY
+# ============================================================
+
+def add_custody_entry(
+        evidence_id,
+        handler,
+        action,
+        notes="",
+        when=None):
+
+    # Check evidence exists
+    found = False
+
+    for evidence in evidence_register:
+
+        if evidence.get("evidence_id") == evidence_id:
+
+            found = True
+            break
+
+    if not found:
+
+        print(
+            f"[!] Unknown evidence ID: {evidence_id}"
+        )
+
+        return None
+
+    entry = {
+
+        "evidence_id": evidence_id,
+
+        "handler": handler,
+
+        "datetime":
+            when
+            if when
+            else datetime.now().strftime(TS_FORMAT),
+
+        "action": action,
+
+        "notes": notes
+    }
+
+    custody_log.append(entry)
+
+    print(
+        f"[OK] Custody entry added for {evidence_id}"
+    )
+
+    return entry
+
+
+def display_custody_history(evidence_id):
+
+    history = [
+
+        record
+
+        for record in custody_log
+
+        if record.get("evidence_id") == evidence_id
+    ]
+
+    if not history:
+
+        print(
+            f"[!] No custody history found for {evidence_id}"
+        )
+
+        return []
+
+    history.sort(
+        key=lambda x: x.get("datetime", "")
+    )
+
+    print("\n")
+    print("=" * 90)
+    print(
+        f"CHAIN OF CUSTODY - {evidence_id}"
+    )
+    print("=" * 90)
+
+    for entry in history:
+
+        print(
+            f"{entry.get('datetime','')} | "
+            f"{entry.get('handler','')} | "
+            f"{entry.get('action','')} | "
+            f"{entry.get('notes','')}"
+        )
+
+    return history
+
+
+# ============================================================
+# 8. INTEGRITY VERIFICATION
+# ============================================================
+
+def verify_integrity(evidence_id):
+
+    record = None
+
+    for evidence in evidence_register:
+
+        if evidence.get("evidence_id") == evidence_id:
+
+            record = evidence
+            break
+
+    if record is None:
+
+        print(
+            f"[!] Evidence not found: {evidence_id}"
+        )
+
+        return None
+
+    # --------------------------------------------------------
+    # IMPORTANT FIX
+    #
+    # If intake_sha256 is missing, calculate it now.
+    # --------------------------------------------------------
+
+    if not record.get("intake_sha256"):
+
+        actual_file = resolve_evidence_path(
+            record.get("file_path", "")
+        )
+
+        if not actual_file:
+
+            print(
+                "[!] Cannot find evidence file."
+            )
+
+            return None
+
+        record["intake_sha256"] = compute_sha256(
+            actual_file
+        )
+
+    # Find actual file
+    full_path = resolve_evidence_path(
+        record.get("file_path", "")
+    )
+
+    if not full_path:
+
+        print(
+            f"[!] Evidence file not found: "
+            f"{record.get('file_path')}"
+        )
+
+        return None
+
+    # Calculate current hash
+    current_hash = compute_sha256(
+        full_path
+    )
+
+    recorded_hash = record.get(
+        "intake_sha256"
+    )
+
+    print("\n")
+    print("=" * 90)
+    print(
+        f"INTEGRITY CHECK - {evidence_id}"
+    )
+    print("=" * 90)
+
+    print(
+        f"Recorded intake hash : {recorded_hash}"
+    )
+
+    print(
+        f"Recomputed hash      : {current_hash}"
+    )
+
+    if current_hash == recorded_hash:
+
+        status = "MATCH"
+
+        print(
+            "\nResult: MATCH"
+        )
+
+        print(
+            "[OK] Evidence integrity verified."
+        )
+
+    else:
+
+        status = "MISMATCH"
+
+        print(
+            "\nResult: MISMATCH"
+        )
+
+        print(
+            "[WARNING] Possible evidence alteration/tampering!"
+        )
+
+    result = {
+
+        "evidence_id": evidence_id,
+
+        "examination_datetime":
+            datetime.now().strftime(TS_FORMAT),
+
+        "recorded_sha256":
+            recorded_hash,
+
+        "recomputed_sha256":
+            current_hash,
+
+        "status":
+            status
+    }
+
+    integrity_log.append(result)
+
+    return result
+
+
+# ============================================================
+# 9. BASELINE VS CURRENT SNAPSHOT
+# ============================================================
+
+def validate_baseline_vs_snapshot():
+
+    baseline_rows = load_csv(
+        "baseline_hashes.csv"
+    )
+
+    current_rows = load_csv(
+        "current_snapshot_hashes.csv"
+    )
+
+    baseline = {}
+
+    current = {}
+
+    for row in baseline_rows:
+
+        baseline[
+            row["filename"]
+        ] = row["baseline_sha256"]
+
+    for row in current_rows:
+
+        current[
+            row["filename"]
+        ] = row["current_sha256"]
+
+    all_files = sorted(
+        set(baseline.keys()) |
+        set(current.keys())
+    )
+
+    results = []
+
+    print("\n")
+    print("=" * 100)
+    print(
+        "BASELINE VS CURRENT SNAPSHOT VALIDATION"
+    )
+    print("=" * 100)
+
+    print(
+        f"{'Filename':<30}"
+        f"{'Status':<15}"
+    )
+
+    print("-" * 100)
+
+    for filename in all_files:
+
+        if (
+            filename in baseline
+            and filename in current
+        ):
+
+            if (
+                baseline[filename]
+                == current[filename]
+            ):
+
+                status = "UNCHANGED"
+
+            else:
+
+                status = "MODIFIED"
+
+        elif (
+            filename in current
+            and filename not in baseline
+        ):
+
+            status = "NEW"
+
+        else:
+
+            status = "MISSING"
+
+        result = {
+
+            "filename": filename,
+
+            "status": status,
+
+            "baseline_sha256":
+                baseline.get(
+                    filename,
+                    "-"
+                ),
+
+            "current_sha256":
+                current.get(
+                    filename,
+                    "-"
+                )
+        }
+
+        results.append(result)
+
+        print(
+            f"{filename:<30}"
+            f"{status:<15}"
+        )
+
+    flagged = [
+
+        r
+
+        for r in results
+
+        if r["status"]
+        in [
+            "MODIFIED",
+            "NEW",
+            "MISSING"
+        ]
+    ]
+
+    print("\n")
+    print(
+        f"Files requiring investigation: "
+        f"{len(flagged)}"
+    )
+
+    for item in flagged:
+
+        print(
+            f"  {item['filename']} "
+            f"-> {item['status']}"
+        )
+
+    return results
+
+
+# ============================================================
+# 10. TIMESTAMP
+# ============================================================
+
+def parse_timestamp(timestamp):
+
+    return datetime.strptime(
+        timestamp,
+        TS_FORMAT
+    )
+
+
+# ============================================================
+# 11. MULTI-SOURCE TIMELINE
+# ============================================================
+
+def reconstruct_timeline():
+
+    timeline = []
+
+    # ---------------- AUTHENTICATION ----------------
+
+    auth_rows = load_csv(
+        "auth_log.csv"
+    )
+
+    for row in auth_rows:
+
+        timeline.append({
+
+            "timestamp":
+                row["timestamp"],
+
+            "source":
+                "AUTH",
+
+            "description":
+                (
+                    f"{row['event']} - "
+                    f"user={row['username']} "
+                    f"from {row['source_ip']} "
+                    f"on {row['workstation']}"
+                )
+        })
+
+    # ---------------- FILE ACTIVITY ----------------
+
+    file_rows = load_csv(
+        "file_activity_log.csv"
+    )
+
+    for row in file_rows:
+
+        timeline.append({
+
+            "timestamp":
+                row["timestamp"],
+
+            "source":
+                "FILE",
+
+            "description":
+                (
+                    f"{row['action']} - "
+                    f"{row['filename']} "
+                    f"by {row['user']} "
+                    f"on {row['workstation']}"
+                )
+        })
+
+    # ---------------- NETWORK ----------------
+
+    network_rows = load_csv(
+        "network_log.csv"
+    )
+
+    for row in network_rows:
+
+        timeline.append({
+
+            "timestamp":
+                row["timestamp"],
+
+            "source":
+                "NETWORK",
+
+            "description":
+                (
+                    f"Outbound "
+                    f"{row['protocol']} "
+                    f"to {row['dest_ip']}:"
+                    f"{row['dest_port']} "
+                    f"({row['bytes_sent']} bytes) "
+                    f"from {row['workstation']}"
+                )
+        })
+
+    # -------------------------------------------------
+    # Convert timestamp to datetime BEFORE sorting
+    # -------------------------------------------------
+
+    timeline.sort(
+        key=lambda x:
+        parse_timestamp(
+            x["timestamp"]
+        )
+    )
+
+    print("\n")
+    print("=" * 110)
+    print(
+        "RECONSTRUCTED MULTI-SOURCE TIMELINE"
+    )
+    print("=" * 110)
+
+    for event in timeline:
+
+        print(
+            f"{event['timestamp']} "
+            f"[{event['source']:<7}] "
+            f"{event['description']}"
+        )
+
+    return timeline
+
+
+# ============================================================
+# 12. INCIDENT ANALYSIS
+# ============================================================
+
+def analyze_incident(timeline=None):
+
+    if timeline is None:
+
+        timeline = reconstruct_timeline()
+
+    suspicious_events = []
+
+    for event in timeline:
+
+        text = event[
+            "description"
+        ].upper()
+
+        if "FAILED_LOGIN" in text:
+
+            suspicious_events.append(
+                event
+            )
+
+    if not suspicious_events:
+
+        print(
+            "\n[!] No suspicious FAILED_LOGIN event found."
+        )
+
+        return None
+
+    earliest = suspicious_events[0]
+
+    earliest_time = parse_timestamp(
+        earliest["timestamp"]
+    )
+
+    related_events = []
+
+    for event in timeline:
+
+        event_time = parse_timestamp(
+            event["timestamp"]
+        )
+
+        if event_time > earliest_time:
+
+            related_events.append(
+                event
+            )
+
+    print("\n")
+    print("=" * 100)
+    print(
+        "INCIDENT ANALYSIS"
+    )
+    print("=" * 100)
+
+    print(
+        "\nEarliest suspicious event:"
+    )
+
+    print(
+        f"{earliest['timestamp']} "
+        f"[{earliest['source']}] "
+        f"{earliest['description']}"
+    )
+
+    print(
+        "\nSubsequent potentially related activity:"
+    )
+
+    for event in related_events:
+
+        print(
+            f" -> {event['timestamp']} "
+            f"[{event['source']:<7}] "
+            f"{event['description']}"
+        )
+
+    return {
+
+        "earliest_suspicious":
+            earliest,
+
+        "subsequent_activity":
+            related_events
+    }
+
+
+# ============================================================
+# 13. FORENSIC REPORT
+# ============================================================
+
+def generate_report(
+        case_id="CASE-2026-0311",
+        investigator_lead="vamsi"):
+
+    timeline = reconstruct_timeline()
+
+    validation = (
+        validate_baseline_vs_snapshot()
+    )
+
+    analysis = analyze_incident(
+        timeline
+    )
+
+    report = []
+
+    report.append(
+        "=" * 90
+    )
+
+    report.append(
+        "DIGITAL FORENSIC EXAMINATION REPORT"
+        .center(90)
+    )
+
+    report.append(
+        "=" * 90
+    )
+
+    report.append(
+        f"Case ID: {case_id}"
+    )
+
+    report.append(
+        f"Lead Investigator: {investigator_lead}"
+    )
+
+    report.append(
+        "Report Generated: "
+        + datetime.now().strftime(
+            TS_FORMAT
+        )
+    )
+
+    report.append("")
+
+    # --------------------------------------------------------
+    # Evidence
+    # --------------------------------------------------------
+
+    report.append(
+        "--- 1. EVIDENCE EXAMINED ---"
+    )
+
+    incomplete = []
+
+    for record in evidence_register:
+
+        missing = validate_metadata(
+            record
+        )
+
+        if missing:
+
+            incomplete.append(
+                (
+                    record.get(
+                        "evidence_id",
+                        "UNKNOWN"
+                    ),
+                    missing
+                )
+            )
+
+        report.append(
+            f"{record.get('evidence_id','?')} | "
+            f"{record.get('source','?')} | "
+            f"Acquired: "
+            f"{record.get('acquisition_datetime','?')} | "
+            f"SHA-256: "
+            f"{record.get('intake_sha256','?')}"
+        )
+
+    # --------------------------------------------------------
